@@ -17,6 +17,7 @@ limitations under the License.
 package translator
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -79,6 +80,15 @@ func (t *TimeSeriesBuilder) Build() ([]*v3.TimeSeries, time.Time, error) {
 	metricFamilies, err := t.batch.metrics.Build(t.config, t.cache)
 	if err != nil {
 		return ts, time.Now(), err
+	}
+	fmt.Printf("\nLEN: %d\n", len(metricFamilies))
+	for _, x := range metricFamilies {
+		data, err := json.Marshal(x)
+		if err != nil {
+			fmt.Printf("ERROR: %s\n", err)
+		} else {
+			fmt.Printf("METRIC: %s\n", data)
+		}
 	}
 	// Get start time before whitelisting, because process start time
 	// metric is likely not to be whitelisted.
@@ -261,8 +271,10 @@ func translateFamily(config *config.CommonConfig,
 	if _, found := supportedMetricTypes[family.GetType()]; !found {
 		return ts, fmt.Errorf("metric type %v of family %s not supported", family.GetType(), family.GetName())
 	}
+	valueType := extractValueType(family, cache.getMetricDescriptor(family.GetName()))
+	fmt.Printf("VALUETYPE: %s %s\n", family.GetName(), valueType)
 	for _, metric := range family.GetMetric() {
-		t := translateOne(config, family.GetName(), family.GetType(), metric, startTime, timestamp, cache)
+		t := translateOne(config, family.GetName(), family.GetType(), metric, startTime, timestamp, valueType)
 		ts = append(ts, t)
 		glog.V(4).Infof("%+v\nMetric: %+v, Interval: %+v", *t, *(t.Metric), t.Points[0].Interval)
 	}
@@ -284,7 +296,8 @@ func translateOne(config *config.CommonConfig,
 	metric *dto.Metric,
 	start time.Time,
 	end time.Time,
-	cache *MetricDescriptorCache) *v3.TimeSeries {
+	valueType string,
+	) *v3.TimeSeries {
 	interval := &v3.TimeInterval{
 		EndTime: end.UTC().Format(time.RFC3339),
 	}
@@ -292,7 +305,6 @@ func translateOne(config *config.CommonConfig,
 	if metricKind == "CUMULATIVE" {
 		interval.StartTime = start.UTC().Format(time.RFC3339)
 	}
-	valueType := extractValueType(mType, cache.getMetricDescriptor(name))
 	point := &v3.Point{
 		Interval: interval,
 		Value: &v3.TypedValue{
@@ -406,7 +418,7 @@ func MetricFamilyToMetricDescriptor(config *config.CommonConfig,
 		Description: family.GetHelp(),
 		Type:        getMetricType(config, family.GetName()),
 		MetricKind:  extractMetricKind(family.GetType()),
-		ValueType:   extractValueType(family.GetType(), originalDescriptor),
+		ValueType:   extractValueType(family, originalDescriptor),
 		Labels:      extractAllLabels(family, originalDescriptor),
 	}
 }
@@ -418,20 +430,44 @@ func extractMetricKind(mType dto.MetricType) string {
 	return "GAUGE"
 }
 
-func extractValueType(mType dto.MetricType, originalDescriptor *v3.MetricDescriptor) string {
+func extractValueType(family *dto.MetricFamily, originalDescriptor *v3.MetricDescriptor) string {
 	// If MetricDescriptor is created already in the Stackdriver use stored value type.
 	// This is going to work perfectly for "container.googleapis.com" metrics.
+	fmt.Printf("WTF %s %s\n", family.GetName(), family.GetType())
 	if originalDescriptor != nil {
 		// TODO(loburm): for custom metrics add logic that can figure value type base on the actual values.
 		return originalDescriptor.ValueType
 	}
-	if mType == dto.MetricType_HISTOGRAM {
+	switch family.GetType() {
+	case dto.MetricType_HISTOGRAM:
 		return "DISTRIBUTION"
-	}
-	if mType == dto.MetricType_UNTYPED {
+	case dto.MetricType_UNTYPED, dto.MetricType_SUMMARY:
 		return "DOUBLE"
 	}
-	return "INT64"
+	anyDouble := false
+	allZero := true
+	for _, m := range family.Metric {
+		var val float64
+		switch {
+		case family.GetType() == dto.MetricType_GAUGE:
+			val = m.GetGauge().GetValue()
+		case family.GetType() == dto.MetricType_COUNTER:
+			val = m.GetCounter().GetValue()
+		}
+		if val != float64(int(val)) {
+			anyDouble = true
+		}
+		if val != 0 {
+			allZero = false
+		}
+	}
+	fmt.Printf("WTF %s %v %v\n", family.GetName(), anyDouble, allZero)
+	// If all values in metric are zero we cannot safly decide if metric is int so we fallback to DOUBLE
+	if anyDouble || allZero {
+		return "DOUBLE"
+	} else {
+		return "INT64"
+	}
 }
 
 func extractAllLabels(family *dto.MetricFamily, originalDescriptor *v3.MetricDescriptor) []*v3.LabelDescriptor {

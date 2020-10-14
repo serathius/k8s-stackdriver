@@ -550,7 +550,7 @@ func TestGetMonitoredResourceFromLabels(t *testing.T) {
 	}
 }
 
-func TestTranslatePrometheusToStackdriver(t *testing.T) {
+func TestTranslatePrometheusToStackdriverWithCache(t *testing.T) {
 	cache := buildCacheForTesting()
 
 	tsb := NewTimeSeriesBuilder(CommonConfigWithMetrics([]string{intMetricName, histogramMetricName, booleanMetricName, floatMetricName}), cache)
@@ -561,6 +561,8 @@ func TestTranslatePrometheusToStackdriver(t *testing.T) {
 	assert.Equal(t, err, nil)
 
 	assert.Equal(t, 7, len(ts))
+	//assert.Equal(t, 0, len(tsb.cache.broken))
+	//assert.Equal(t, 7, len(tsb.cache.descriptors))
 	// TranslatePrometheusToStackdriver uses maps to represent data, so order of output is randomized.
 	sort.Sort(ByMetricTypeReversed(ts))
 
@@ -671,6 +673,86 @@ func testBool(t *testing.T, metric *v3.TimeSeries) {
 	} else {
 		t.Errorf("Wrong label labelName value %s", labels["labelName"])
 	}
+}
+func TestTranslatePrometheusToStackdriverWithoutCache(t *testing.T) {
+	cache := NewMetricDescriptorCache(nil, commonConfig)
+
+	tsb := NewTimeSeriesBuilder(CommonConfigWithMetrics([]string{testMetricName, testMetricHistogram, floatMetricName}), cache)
+	tsb.Update(metricsResponse, now)
+	ts, timestamp, err := tsb.Build()
+	assert.Equal(t, timestamp, now)
+
+	assert.Equal(t, err, nil)
+
+	assert.Equal(t, 5, len(ts))
+	//assert.Equal(t, 0, len(tsb.cache.broken))
+	//assert.Equal(t, 7, len(tsb.cache.descriptors))
+	// TranslatePrometheusToStackdriver uses maps to represent data, so order of output is randomized.
+	sort.Sort(ByMetricTypeReversed(ts))
+
+	// First three int values.
+	for i := 0; i <= 2; i++ {
+		metric := ts[i]
+		assert.Equal(t, "gke_container", metric.Resource.Type)
+		assert.Equal(t, "container.googleapis.com/master/testcomponent/test_name", metric.Metric.Type)
+		assert.Equal(t, "INT64", metric.ValueType)
+		assert.Equal(t, "CUMULATIVE", metric.MetricKind)
+
+		assert.Equal(t, 1, len(metric.Points))
+		assert.Equal(t, "2009-02-13T23:31:30Z", metric.Points[0].Interval.StartTime)
+
+		labels := metric.Metric.Labels
+		assert.Equal(t, 1, len(labels))
+
+		if labels["labelName"] == "labelValue1" {
+			assert.Equal(t, int64(42), *(metric.Points[0].Value.Int64Value))
+		} else if labels["labelName"] == "labelValue2" {
+			assert.Equal(t, int64(106), *(metric.Points[0].Value.Int64Value))
+		} else if labels["labelName"] == "labelValue3" {
+			assert.Equal(t, int64(136), *(metric.Points[0].Value.Int64Value))
+		} else {
+			t.Errorf("Wrong label labelName value %s", labels["labelName"])
+		}
+	}
+
+	// Histogram
+	metric := ts[3]
+	assert.Equal(t, "gke_container", metric.Resource.Type)
+	assert.Equal(t, "container.googleapis.com/master/testcomponent/test_histogram", metric.Metric.Type)
+	assert.Equal(t, "DISTRIBUTION", metric.ValueType)
+	assert.Equal(t, "CUMULATIVE", metric.MetricKind)
+	assert.Equal(t, 1, len(metric.Points))
+
+	p := metric.Points[0]
+
+	dist := p.Value.DistributionValue
+	assert.NotNil(t, dist)
+	assert.Equal(t, int64(5), dist.Count)
+	assert.InEpsilon(t, 2.6, dist.Mean, epsilon)
+	assert.InEpsilon(t, 11.25, dist.SumOfSquaredDeviation, epsilon)
+
+	bounds := dist.BucketOptions.ExplicitBuckets.Bounds
+	assert.Equal(t, 3, len(bounds))
+	assert.InEpsilon(t, 1, bounds[0], epsilon)
+	assert.InEpsilon(t, 3, bounds[1], epsilon)
+	assert.InEpsilon(t, 5, bounds[2], epsilon)
+
+	counts := dist.BucketCounts
+	assert.Equal(t, 4, len(counts))
+	assert.Equal(t, int64(1), counts[0])
+	assert.Equal(t, int64(3), counts[1])
+	assert.Equal(t, int64(0), counts[2])
+	assert.Equal(t, int64(1), counts[3])
+
+	// Then float value.
+	metric = ts[4]
+	assert.Equal(t, "gke_container", metric.Resource.Type)
+	assert.Equal(t, "container.googleapis.com/master/testcomponent/float_metric", metric.Metric.Type)
+	assert.Equal(t, "DOUBLE", metric.ValueType)
+	assert.Equal(t, "CUMULATIVE", metric.MetricKind)
+	assert.InEpsilon(t, 123.17, *(metric.Points[0].Value.DoubleValue), epsilon)
+	assert.Equal(t, 1, len(metric.Points))
+	assert.Equal(t, "2009-02-13T23:31:30Z", metric.Points[0].Interval.StartTime)
 }
 
 func TestTranslatePrometheusToStackdriverWithLabelFiltering(t *testing.T) {
